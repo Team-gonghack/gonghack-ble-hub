@@ -5,163 +5,116 @@
 #include <BLE2902.h>
 #include <Arduino.h>
 
-// ==================== UUID 설정 ====================
-#define SOURCE_MAC          "1C:69:20:E2:6D:2A"
+#define SOURCE_MAC "1C:69:20:E2:6D:2A"
 #define SOURCE_SERVICE_UUID "180D"
-#define SOURCE_CHAR_UUID    "2A37"
+#define SOURCE_CHAR_UUID "2A37"
+#define LED_CTRL_UUID "2A56"
 
-#define RELAY_SERVICE_UUID  "12345678-1234-5678-1234-56789abcdef0"
-#define RELAY_CHAR_UUID     "abcdefab-cdef-1234-5678-1234567890ab"
+#define RELAY_SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
+#define RELAY_CHAR_UUID "abcdefab-cdef-1234-5678-1234567890ab"
 
-// ==================== BLE 객체 ====================
-BLEClient* pClient = nullptr;
-BLERemoteCharacteristic* pRemoteChar = nullptr;
-BLECharacteristic* pRelayChar = nullptr;
-bool connectedToSource = false;
-bool clientConnected = false;
+BLEClient *pClient = nullptr;
+BLERemoteCharacteristic *pRemoteBpmChar = nullptr;
+BLERemoteCharacteristic *pRemoteLedChar = nullptr;
+BLECharacteristic *pRelayChar = nullptr;
 
-// FreeRTOS 핸들
-TaskHandle_t TaskConnectSourceHandle;
-TaskHandle_t TaskRelayNotifyHandle;
-
-// 수신된 BPM 값을 안전하게 공유하기 위한 뮤텍스
+bool connectedToWearable = false;
+bool smartphoneConnected = false;
 SemaphoreHandle_t bpmMutex;
-uint8_t latestBPM = 0;
 
-// ==================== Notify 콜백 ====================
+uint8_t latestBPM = 0;
+int latestValue = 0;
+
 class MyNotifyCallback {
 public:
-  void operator()(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
-    if (length > 0) {
-      uint8_t bpmValue = pData[0];
-      Serial.printf("📡 Received BPM from source: %d\n", bpmValue);
-
-      // 뮤텍스로 BPM 값 보호
-      if (xSemaphoreTake(bpmMutex, portMAX_DELAY) == pdTRUE) {
-        latestBPM = bpmValue;
+  void operator()(BLERemoteCharacteristic *pChar, uint8_t *pData, size_t len, bool isNotify) {
+    if (len > 0) {
+      uint8_t bpm = pData[0];
+      if (xSemaphoreTake(bpmMutex, portMAX_DELAY)) {
+        latestBPM = bpm;
         xSemaphoreGive(bpmMutex);
       }
+      Serial.printf("💓 BPM from wearable: %d\n", bpm);
     }
   }
 };
 
-// ==================== BLE 서버 콜백 ====================
 class RelayServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    Serial.println("📱 Smartphone connected to relay server");
-    clientConnected = true;
+  void onConnect(BLEServer *pServer) override {
+    smartphoneConnected = true;
+    Serial.println("📱 Smartphone connected");
   }
-  void onDisconnect(BLEServer* pServer) override {
-    Serial.println("📴 Smartphone disconnected");
-    clientConnected = false;
+  void onDisconnect(BLEServer *pServer) override {
+    smartphoneConnected = false;
     pServer->getAdvertising()->start();
+    Serial.println("📴 Smartphone disconnected");
   }
 };
 
-// ==================== 릴레이 서버 초기화 ====================
-void setupRelayServer() {
-  BLEDevice::init("ESP32_BPM_Relay");
-
-  BLEServer* pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new RelayServerCallbacks());
-
-  BLEService* pService = pServer->createService(RELAY_SERVICE_UUID);
-  pRelayChar = pService->createCharacteristic(
-                  RELAY_CHAR_UUID,
-                  BLECharacteristic::PROPERTY_NOTIFY
-                );
-  pRelayChar->addDescriptor(new BLE2902());
-  pService->start();
-
-  pServer->getAdvertising()->start();
-  Serial.println("🚀 Relay BLE Server started (waiting for smartphone)");
-}
-
-// ==================== 원본 ESP32 연결 ====================
-bool connectToSource() {
-  Serial.printf("🔗 Connecting to source: %s\n", SOURCE_MAC);
-
+bool connectToWearable() {
   BLEAddress srcAddr(SOURCE_MAC);
   pClient = BLEDevice::createClient();
+  if (!pClient->connect(srcAddr)) return false;
 
-  if (!pClient->connect(srcAddr)) {
-    Serial.println("❌ Failed to connect to source server");
-    return false;
-  }
+  BLERemoteService *pService = pClient->getService(SOURCE_SERVICE_UUID);
+  if (!pService) return false;
 
-  Serial.println("✅ Connected to source server");
-  BLERemoteService* pService = pClient->getService(SOURCE_SERVICE_UUID);
-  if (!pService) {
-    Serial.println("❌ Source service not found");
-    pClient->disconnect();
-    return false;
-  }
-
-  pRemoteChar = pService->getCharacteristic(SOURCE_CHAR_UUID);
-  if (!pRemoteChar) {
-    Serial.println("❌ Source characteristic not found");
-    pClient->disconnect();
-    return false;
-  }
-
-  if (pRemoteChar->canNotify()) {
-    pRemoteChar->registerForNotify(MyNotifyCallback());
-    Serial.println("🔔 Notify registered from source");
-  }
-
-  connectedToSource = true;
+  pRemoteBpmChar = pService->getCharacteristic(SOURCE_CHAR_UUID);
+  pRemoteLedChar = pService->getCharacteristic(LED_CTRL_UUID);
+  if (pRemoteBpmChar && pRemoteBpmChar->canNotify())
+    pRemoteBpmChar->registerForNotify(MyNotifyCallback());
+  connectedToWearable = true;
+  Serial.println("✅ Connected to wearable");
   return true;
 }
 
-// ==================== Task: 원본 ESP32 연결 및 유지 ====================
-void TaskConnectSource(void* pvParameters) {
-  for (;;) {
-    if (!connectedToSource) {
-      if (connectToSource()) {
-        Serial.println("📡 Source reconnected");
-      } else {
-        Serial.println("🔄 Retrying connection to source...");
-      }
-    }
-    vTaskDelay(5000 / portTICK_PERIOD_MS); // 5초마다 재시도
-  }
+void setupRelayServer() {
+  BLEDevice::init("ESP32_BPM_Relay");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new RelayServerCallbacks());
+  BLEService *pService = pServer->createService(RELAY_SERVICE_UUID);
+
+  pRelayChar = pService->createCharacteristic(RELAY_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pRelayChar->addDescriptor(new BLE2902());
+  pService->start();
+  pServer->getAdvertising()->start();
 }
 
-// ==================== Task: 릴레이 Notify 전송 ====================
-void TaskRelayNotify(void* pvParameters) {
-  uint8_t bpmCopy = 0;
-  for (;;) {
-    if (clientConnected && pRelayChar) {
-      if (xSemaphoreTake(bpmMutex, 0) == pdTRUE) {
-        bpmCopy = latestBPM;
-        xSemaphoreGive(bpmMutex);
-      }
-      if (bpmCopy > 0) {
-        pRelayChar->setValue(&bpmCopy, 1);
-        pRelayChar->notify();
-        Serial.printf("📤 Relayed BPM: %d\n", bpmCopy);
-      }
-    }
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // 1초마다 전송
-  }
-}
-
-// ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== ESP32 BLE Relay with FreeRTOS ===");
-
   bpmMutex = xSemaphoreCreateMutex();
   setupRelayServer();
-
-  // BLE Client(소스 연결) Task → Core 0
-  xTaskCreatePinnedToCore(TaskConnectSource, "TaskConnectSource", 4096, NULL, 1, &TaskConnectSourceHandle, 0);
-
-  // BLE Notify 전송 Task → Core 1
-  xTaskCreatePinnedToCore(TaskRelayNotify, "TaskRelayNotify", 4096, NULL, 1, &TaskRelayNotifyHandle, 1);
+  connectToWearable();
 }
 
 void loop() {
-  vTaskDelay(100 / portTICK_PERIOD_MS);
+  // ① TX/RX로부터 값 수신
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    latestValue = input.toInt();
+    Serial.printf("📨 Received integer via UART: %d\n", latestValue);
+
+    // ② 웨어러블로 전송
+    if (connectedToWearable && pRemoteLedChar) {
+      uint8_t v = latestValue;
+      pRemoteLedChar->writeValue(&v, 1);
+      Serial.printf("➡️ Sent integer to wearable: %d\n", v);
+    }
+  }
+
+  // ③ 스마트폰으로 BPM + 정수 함께 전송
+  if (smartphoneConnected && pRelayChar) {
+    uint8_t bpmCopy = 0;
+    if (xSemaphoreTake(bpmMutex, 0) == pdTRUE) {
+      bpmCopy = latestBPM;
+      xSemaphoreGive(bpmMutex);
+    }
+
+    uint8_t data[2] = { bpmCopy, (uint8_t)latestValue };
+    pRelayChar->setValue(data, 2);
+    pRelayChar->notify();
+    Serial.printf("📤 Relayed [BPM:%d | VAL:%d] to phone\n", bpmCopy, latestValue);
+  }
+
+  delay(1000);
 }
