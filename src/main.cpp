@@ -22,8 +22,9 @@ bool connectedToWearable = false;
 bool smartphoneConnected = false;
 SemaphoreHandle_t bpmMutex;
 
-uint8_t latestBPM = 0;
-int latestValue = 0;
+uint8_t latestBPM = 0;      // 웨어러블에서 수신
+int latestPosture = 0;      // UART에서 수신 (자세)
+uint8_t latestMovement = 0; // UART에서 수신 (움직임)
 
 class MyNotifyCallback {
 public:
@@ -61,8 +62,10 @@ bool connectToWearable() {
 
   pRemoteBpmChar = pService->getCharacteristic(SOURCE_CHAR_UUID);
   pRemoteLedChar = pService->getCharacteristic(LED_CTRL_UUID);
+
   if (pRemoteBpmChar && pRemoteBpmChar->canNotify())
     pRemoteBpmChar->registerForNotify(MyNotifyCallback());
+
   connectedToWearable = true;
   Serial.println("✅ Connected to wearable");
   return true;
@@ -76,6 +79,7 @@ void setupRelayServer() {
 
   pRelayChar = pService->createCharacteristic(RELAY_CHAR_UUID, BLECharacteristic::PROPERTY_NOTIFY);
   pRelayChar->addDescriptor(new BLE2902());
+
   pService->start();
   pServer->getAdvertising()->start();
 }
@@ -88,21 +92,31 @@ void setup() {
 }
 
 void loop() {
-  // ① TX/RX로부터 값 수신
+  // ① UART에서 CSV 데이터 수신 ("자세,움직임")
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
-    latestValue = input.toInt();
-    Serial.printf("📨 Received integer via UART: %d\n", latestValue);
+    input.trim();
 
-    // ② 웨어러블로 전송
-    if (connectedToWearable && pRemoteLedChar) {
-      uint8_t v = latestValue;
-      pRemoteLedChar->writeValue(&v, 1);
-      Serial.printf("➡️ Sent integer to wearable: %d\n", v);
+    int commaIndex = input.indexOf(',');
+    if (commaIndex > 0) {
+      String postureStr = input.substring(0, commaIndex);
+      String moveStr = input.substring(commaIndex + 1);
+
+      latestPosture = postureStr.toInt();
+      latestMovement = (uint8_t)moveStr.toInt();
+
+      Serial.printf("📨 Received [Posture:%d, Movement:%d]\n", latestPosture, latestMovement);
+
+      // ② 자세 수치는 웨어러블로 전송
+      if (connectedToWearable && pRemoteLedChar) {
+        uint8_t v = (uint8_t)latestPosture;
+        pRemoteLedChar->writeValue(&v, 1);
+        Serial.printf("➡️ Sent posture to wearable: %d\n", v);
+      }
     }
   }
 
-  // ③ 스마트폰으로 BPM + 정수 함께 전송
+  // ③ 스마트폰으로 BPM + 자세 + 움직임 전송
   if (smartphoneConnected && pRelayChar) {
     uint8_t bpmCopy = 0;
     if (xSemaphoreTake(bpmMutex, 0) == pdTRUE) {
@@ -110,10 +124,18 @@ void loop() {
       xSemaphoreGive(bpmMutex);
     }
 
-    uint8_t data[2] = { bpmCopy, (uint8_t)latestValue };
-    pRelayChar->setValue(data, 2);
+    // 3바이트 패킷 [BPM, VAL, MOV]
+    uint8_t data[3] = {
+      bpmCopy,
+      (uint8_t)latestPosture,
+      latestMovement
+    };
+
+    pRelayChar->setValue(data, 3);
     pRelayChar->notify();
-    Serial.printf("📤 Relayed [BPM:%d | VAL:%d] to phone\n", bpmCopy, latestValue);
+
+    Serial.printf("📤 Relayed [BPM:%d | VAL:%d | MOV:%d] to phone\n",
+                  bpmCopy, latestPosture, latestMovement);
   }
 
   delay(1000);
